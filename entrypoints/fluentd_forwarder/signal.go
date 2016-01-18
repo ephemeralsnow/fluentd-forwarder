@@ -4,6 +4,7 @@ import (
 	fluentd_forwarder "github.com/fluent/fluentd-forwarder"
 	"os"
 	"os/signal"
+	"syscall"
 )
 
 type SignalHandler struct {
@@ -12,7 +13,7 @@ type SignalHandler struct {
 }
 
 func (handler *SignalHandler) Start() {
-	signal.Notify(handler.signalChan, os.Kill, os.Interrupt)
+	signal.Notify(handler.signalChan, syscall.SIGINT, syscall.SIGKILL, syscall.SIGTERM)
 	go func() {
 		<-handler.signalChan
 		for _, worker := range handler.Workers.Slice() {
