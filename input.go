@@ -28,14 +28,30 @@ import (
 	"io"
 	"net"
 	"reflect"
+	"regexp"
 	"sync"
 	"sync/atomic"
 )
 
+var (
+	listenAddrRegexp = regexp.MustCompile("^(tcp|unix)://(.+)$")
+)
+
+type ForwardListener interface {
+	io.Closer
+	Accept() (c net.Conn, err error)
+}
+
+type ForwardConn interface {
+	io.Reader
+	io.Closer
+	RemoteAddr() net.Addr
+}
+
 type forwardClient struct {
 	input  *ForwardInput
 	logger *logging.Logger
-	conn   *net.TCPConn
+	conn   ForwardConn
 	codec  *codec.MsgpackHandle
 	dec    *codec.Decoder
 }
@@ -45,12 +61,12 @@ type ForwardInput struct {
 	port           Port
 	logger         *logging.Logger
 	bind           string
-	listener       *net.TCPListener
+	listener       ForwardListener
 	codec          *codec.MsgpackHandle
 	clientsMtx     sync.Mutex
-	clients        map[*net.TCPConn]*forwardClient
+	clients        map[ForwardConn]*forwardClient
 	wg             sync.WaitGroup
-	acceptChan     chan *net.TCPConn
+	acceptChan     chan ForwardConn
 	shutdownChan   chan struct{}
 	isShuttingDown uintptr
 }
@@ -193,7 +209,8 @@ func (c *forwardClient) startHandling() {
 			c.input.markDischarged(c)
 			c.input.wg.Done()
 		}()
-		c.input.logger.Infof("Started handling connection from %s", c.conn.RemoteAddr().String())
+		remoteAddr := c.conn.RemoteAddr().String()
+		c.input.logger.Infof("Started handling connection from %s", remoteAddr)
 		for {
 			recordSets, err := c.decodeEntries()
 			if err != nil {
@@ -205,7 +222,7 @@ func (c *forwardClient) startHandling() {
 					}
 				}
 				if err == io.EOF {
-					c.logger.Infof("Client %s closed the connection", c.conn.RemoteAddr().String())
+					c.logger.Infof("Client %s closed the connection", remoteAddr)
 				} else {
 					c.logger.Error(err.Error())
 				}
@@ -220,7 +237,7 @@ func (c *forwardClient) startHandling() {
 				}
 			}
 		}
-		c.input.logger.Infof("Ended handling connection from %s", c.conn.RemoteAddr().String())
+		c.input.logger.Infof("Ended handling connection from %s", remoteAddr)
 	}()
 }
 
@@ -231,7 +248,7 @@ func (c *forwardClient) shutdown() {
 	}
 }
 
-func newForwardClient(input *ForwardInput, logger *logging.Logger, conn *net.TCPConn, _codec *codec.MsgpackHandle) *forwardClient {
+func newForwardClient(input *ForwardInput, logger *logging.Logger, conn ForwardConn, _codec *codec.MsgpackHandle) *forwardClient {
 	c := &forwardClient{
 		input:  input,
 		logger: logger,
@@ -253,7 +270,7 @@ func (input *ForwardInput) spawnAcceptor() {
 		}()
 		input.logger.Notice("Acceptor started")
 		for {
-			conn, err := input.listener.AcceptTCP()
+			conn, err := input.listener.Accept()
 			if err != nil {
 				input.logger.Notice(err.Error())
 				break
@@ -262,7 +279,7 @@ func (input *ForwardInput) spawnAcceptor() {
 				input.logger.Noticef("Connected from %s", conn.RemoteAddr().String())
 				input.acceptChan <- conn
 			} else {
-				input.logger.Notice("AcceptTCP returned nil; something went wrong")
+				input.logger.Notice("Accept returned nil; something went wrong")
 				break
 			}
 		}
@@ -334,12 +351,14 @@ func NewForwardInput(logger *logging.Logger, bind string, port Port) (*ForwardIn
 	_codec := codec.MsgpackHandle{}
 	_codec.MapType = reflect.TypeOf(map[string]interface{}(nil))
 	_codec.RawToString = false
-	addr, err := net.ResolveTCPAddr("tcp", bind)
+
+	network, address, err := parseNetworkAddress(bind)
 	if err != nil {
 		logger.Error(err.Error())
 		return nil, err
 	}
-	listener, err := net.ListenTCP("tcp", addr)
+
+	listener, err := net.Listen(network, address)
 	if err != nil {
 		logger.Error(err.Error())
 		return nil, err
@@ -350,12 +369,21 @@ func NewForwardInput(logger *logging.Logger, bind string, port Port) (*ForwardIn
 		bind:           bind,
 		listener:       listener,
 		codec:          &_codec,
-		clients:        make(map[*net.TCPConn]*forwardClient),
+		clients:        make(map[ForwardConn]*forwardClient),
 		clientsMtx:     sync.Mutex{},
 		entries:        0,
 		wg:             sync.WaitGroup{},
-		acceptChan:     make(chan *net.TCPConn),
+		acceptChan:     make(chan ForwardConn),
 		shutdownChan:   make(chan struct{}),
 		isShuttingDown: uintptr(0),
 	}, nil
+}
+
+func parseNetworkAddress(address string) (string, string, error) {
+	match := listenAddrRegexp.FindStringSubmatch(address)
+	if len(match) != 3 {
+		return "", "", errors.New("Failed to parse listen address")
+	}
+
+	return match[1], match[2], nil
 }

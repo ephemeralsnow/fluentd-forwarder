@@ -52,7 +52,7 @@ func ParseArgs() *DummyServerParams {
 	flagSet.DurationVar(&readTimeout, "read-timeout", MustParseDuration("10s"), "read timeout on wire")
 	flagSet.DurationVar(&writeTimeout, "write-timeout", MustParseDuration("10s"), "write timeout on wire")
 	flagSet.IntVar(&readThrottle, "read-throttle", 0, "read slottling")
-	flagSet.StringVar(&listenOn, "listen-on", "127.0.0.1:80", "interface address and port on which the dummy server listens")
+	flagSet.StringVar(&listenOn, "listen-on", "tcp://127.0.0.1:80", "interface address and port on which the dummy server listens")
 	flagSet.Parse(os.Args[1:])
 
 	return &DummyServerParams{

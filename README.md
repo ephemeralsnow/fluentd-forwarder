@@ -77,7 +77,7 @@ Command-line Options
   Interface address and port on which the forwarder listens.
 
   ```
-  -listen-on 127.0.0.1:24224
+  -listen-on tcp://127.0.0.1:24224
   ```
 
 * -to
