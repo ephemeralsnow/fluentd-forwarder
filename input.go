@@ -49,11 +49,12 @@ type ForwardConn interface {
 }
 
 type forwardClient struct {
-	input  *ForwardInput
-	logger *logging.Logger
-	conn   ForwardConn
-	codec  *codec.MsgpackHandle
-	dec    *codec.Decoder
+	input        *ForwardInput
+	logger       *logging.Logger
+	conn         ForwardConn
+	msgpackCodec *codec.MsgpackHandle
+	jsonCodec    *codec.JsonHandle
+	reader       *bufio.Reader
 }
 
 type ForwardInput struct {
@@ -62,7 +63,8 @@ type ForwardInput struct {
 	logger         *logging.Logger
 	bind           string
 	listener       ForwardListener
-	codec          *codec.MsgpackHandle
+	msgpackCodec   *codec.MsgpackHandle
+	jsonCodec      *codec.JsonHandle
 	clientsMtx     sync.Mutex
 	clients        map[ForwardConn]*forwardClient
 	wg             sync.WaitGroup
@@ -88,7 +90,7 @@ func coerceInPlace(data map[string]interface{}) {
 	}
 }
 
-func (c *forwardClient) decodeRecordSet(tag []byte, entries []interface{}) (FluentRecordSet, error) {
+func (c *forwardClient) decodeRecordSet(tag string, entries []interface{}) (FluentRecordSet, error) {
 	records := make([]TinyFluentRecord, len(entries))
 	for i, _entry := range entries {
 		entry, ok := _entry.([]interface{})
@@ -110,19 +112,39 @@ func (c *forwardClient) decodeRecordSet(tag []byte, entries []interface{}) (Flue
 		}
 	}
 	return FluentRecordSet{
-		Tag:     string(tag), // XXX: byte => rune
+		Tag:     tag,
 		Records: records,
 	}, nil
 }
 
 func (c *forwardClient) decodeEntries() ([]FluentRecordSet, error) {
-	v := []interface{}{nil, nil, nil}
-	err := c.dec.Decode(&v)
+	start, err := c.reader.Peek(1)
 	if err != nil {
 		return nil, err
 	}
-	tag, ok := v[0].([]byte)
-	if !ok {
+
+	var _codec codec.Handle
+	switch start[0] {
+	case '{', '[':
+		_codec = c.jsonCodec
+	default:
+		_codec = c.msgpackCodec
+	}
+	dec := codec.NewDecoder(c.reader, _codec)
+
+	v := []interface{}{nil, nil, nil}
+	err = dec.Decode(&v)
+	if err != nil {
+		return nil, err
+	}
+
+	var tag string
+	switch _tag := v[0].(type) {
+	case []byte:
+		tag = string(_tag) // XXX: byte => rune
+	case string:
+		tag = _tag
+	default:
 		return nil, errors.New("Failed to decode tag field")
 	}
 
@@ -137,7 +159,7 @@ func (c *forwardClient) decodeEntries() ([]FluentRecordSet, error) {
 		coerceInPlace(data)
 		retval = []FluentRecordSet{
 			{
-				Tag: string(tag), // XXX: byte => rune
+				Tag: tag,
 				Records: []TinyFluentRecord{
 					{
 						Timestamp: timestamp,
@@ -154,7 +176,7 @@ func (c *forwardClient) decodeEntries() ([]FluentRecordSet, error) {
 		}
 		retval = []FluentRecordSet{
 			{
-				Tag: string(tag), // XXX: byte => rune
+				Tag: tag,
 				Records: []TinyFluentRecord{
 					{
 						Timestamp: timestamp,
@@ -164,9 +186,6 @@ func (c *forwardClient) decodeEntries() ([]FluentRecordSet, error) {
 			},
 		}
 	case []interface{}:
-		if !ok {
-			return nil, errors.New("Unexpected payload format")
-		}
 		recordSet, err := c.decodeRecordSet(tag, timestamp_or_entries)
 		if err != nil {
 			return nil, err
@@ -175,10 +194,11 @@ func (c *forwardClient) decodeEntries() ([]FluentRecordSet, error) {
 	case []byte:
 		entries := make([]interface{}, 0)
 		reader := bytes.NewReader(timestamp_or_entries)
-		dec := codec.NewDecoder(reader, c.codec)
+		dec := codec.NewDecoder(reader, _codec)
 		for reader.Len() > 0 { // codec.Decoder doesn't return EOF.
 			entry := []interface{}{}
-			if err != dec.Decode(&entry) {
+			err := dec.Decode(&entry)
+			if err != nil {
 				if err == io.EOF { // in case codec.Decoder changes its behavior
 					break
 				}
@@ -248,13 +268,14 @@ func (c *forwardClient) shutdown() {
 	}
 }
 
-func newForwardClient(input *ForwardInput, logger *logging.Logger, conn ForwardConn, _codec *codec.MsgpackHandle) *forwardClient {
+func newForwardClient(input *ForwardInput, logger *logging.Logger, conn ForwardConn, msgpackCodec *codec.MsgpackHandle, jsonCodec *codec.JsonHandle) *forwardClient {
 	c := &forwardClient{
-		input:  input,
-		logger: logger,
-		conn:   conn,
-		codec:  _codec,
-		dec:    codec.NewDecoder(bufio.NewReader(conn), _codec),
+		input:        input,
+		logger:       logger,
+		conn:         conn,
+		msgpackCodec: msgpackCodec,
+		jsonCodec:    jsonCodec,
+		reader:       bufio.NewReader(conn),
 	}
 	input.markCharged(c)
 	return c
@@ -302,7 +323,7 @@ func (input *ForwardInput) spawnDaemon() {
 			case conn := <-input.acceptChan:
 				if conn != nil {
 					input.logger.Notice("Got conn from acceptChan")
-					newForwardClient(input, input.logger, conn, input.codec).startHandling()
+					newForwardClient(input, input.logger, conn, input.msgpackCodec, input.jsonCodec).startHandling()
 				}
 			case <-input.shutdownChan:
 				input.listener.Close()
@@ -348,9 +369,16 @@ func (input *ForwardInput) Stop() {
 }
 
 func NewForwardInput(logger *logging.Logger, bind string, port Port) (*ForwardInput, error) {
-	_codec := codec.MsgpackHandle{}
-	_codec.MapType = reflect.TypeOf(map[string]interface{}(nil))
-	_codec.RawToString = false
+	mapType := reflect.TypeOf(map[string]interface{}(nil))
+	sliceType := reflect.TypeOf([]interface{}{nil, nil, nil})
+
+	msgpackCodec := codec.MsgpackHandle{}
+	msgpackCodec.MapType = mapType
+	msgpackCodec.RawToString = false
+
+	jsonCodec := codec.JsonHandle{}
+	jsonCodec.MapType = mapType
+	jsonCodec.SliceType = sliceType
 
 	network, address, err := parseNetworkAddress(bind)
 	if err != nil {
@@ -364,14 +392,15 @@ func NewForwardInput(logger *logging.Logger, bind string, port Port) (*ForwardIn
 		return nil, err
 	}
 	return &ForwardInput{
+		entries:        0,
 		port:           port,
 		logger:         logger,
 		bind:           bind,
 		listener:       listener,
-		codec:          &_codec,
-		clients:        make(map[ForwardConn]*forwardClient),
+		msgpackCodec:   &msgpackCodec,
+		jsonCodec:      &jsonCodec,
 		clientsMtx:     sync.Mutex{},
-		entries:        0,
+		clients:        make(map[ForwardConn]*forwardClient),
 		wg:             sync.WaitGroup{},
 		acceptChan:     make(chan ForwardConn),
 		shutdownChan:   make(chan struct{}),
