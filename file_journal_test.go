@@ -609,8 +609,7 @@ func Test_Journal_Concurrency(t *testing.T) {
 					cond.L.Unlock()
 					for k := 0; k < 3; k += 1 {
 						data := fmt.Sprintf("test%d\n", i)
-						err = journal.Write([]byte(data))
-						if err != nil {
+						if err := journal.Write([]byte(data)); err != nil {
 							t.Log(err.Error())
 							t.FailNow()
 						}
